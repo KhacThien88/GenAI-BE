@@ -6,6 +6,8 @@ import time
 import logging
 import urllib.parse
 import re
+import requests
+from pydub import AudioSegment
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -14,11 +16,53 @@ bedrock = boto3.client("bedrock-runtime", region_name="ap-southeast-2")
 transcribe = boto3.client("transcribe", region_name="ap-southeast-2")
 s3 = boto3.client("s3", region_name="ap-southeast-2")
 
+# Hàm gọi ElevenLabs để tạo audio
+def synthesize_speech_elevenlabs(text, api_key, voice_id, output_path):
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+        "xi-api-key": api_key
+    }
+    data = {
+        "text": text,
+        "model_id": "eleven_monolingual_v1",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.5
+        }
+    }
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"ElevenLabs API error: {response.status_code} {response.text}")
+            raise Exception(f"ElevenLabs API error: {response.text}")
+
+        # Kiểm tra Content-Type
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "audio/mpeg" not in content_type:
+            logger.error(f"Unexpected Content-Type from ElevenLabs: {content_type}")
+            raise Exception("Invalid audio format from ElevenLabs")
+
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+        logger.debug(f"Synthesized audio saved to {output_path}")
+
+        # Kiểm tra file hợp lệ
+        file_size = os.path.getsize(output_path)
+        if file_size < 1000:
+            logger.error(f"Generated audio file too small: {file_size} bytes")
+            raise Exception("Invalid audio file generated")
+    except requests.RequestException as e:
+        logger.error(f"Error calling ElevenLabs API: {str(e)}")
+        raise
+
 def handle_interview(audio_path: str = None, text_input: str = None) -> dict:
     bucket_name = "chatbotbucket-vkt"
     audio_key = None
     transcript_file = None
     output_audio = None
+    output_ogg = None
     transcript_key = None
     try:
         # Kiểm tra input
@@ -62,7 +106,7 @@ def handle_interview(audio_path: str = None, text_input: str = None) -> dict:
             while attempt < max_attempts:
                 status = transcribe.get_transcription_job(TranscriptionJobName=job_name)
                 job_status = status["TranscriptionJob"]["TranscriptionJobStatus"]
-                logger.debug(f"Transcription job status: {job_status}, Full response: {status}")
+                logger.debug(f"Transcription job status: {job_status}")
                 if job_status in ["COMPLETED", "FAILED"]:
                     break
                 time.sleep(3)
@@ -72,19 +116,18 @@ def handle_interview(audio_path: str = None, text_input: str = None) -> dict:
             if job_status == "COMPLETED":
                 time.sleep(5)  # Wait for S3 consistency
 
-            # Lấy đường dẫn transcript từ TranscriptFileUri
+            # Lấy đường dẫn transcript
             transcript_uri = status["TranscriptionJob"].get("Transcript", {}).get("TranscriptFileUri")
             if not transcript_uri:
                 raise Exception("TranscriptFileUri not found in Transcribe response")
             logger.debug(f"Transcript URI: {transcript_uri}")
 
-            # Trích xuất bucket và key từ URI (hỗ trợ cả s3:// và https://)
+            # Trích xuất bucket và key từ URI
             parsed_uri = urllib.parse.urlparse(transcript_uri)
             if parsed_uri.scheme == "s3":
                 transcript_bucket = parsed_uri.netloc
                 transcript_key = parsed_uri.path.lstrip("/")
             elif parsed_uri.scheme == "https" and "amazonaws.com" in parsed_uri.netloc:
-                # Handle HTTPS URL: https://s3.<region>.amazonaws.com/<bucket>/<key>
                 match = re.match(r"s3\.([a-z0-9-]+)\.amazonaws\.com", parsed_uri.netloc)
                 if not match:
                     raise Exception(f"Invalid TranscriptFileUri netloc: {parsed_uri.netloc}")
@@ -129,7 +172,7 @@ def handle_interview(audio_path: str = None, text_input: str = None) -> dict:
             logger.debug(f"Text input: {question}")
 
         # Step 2: Gửi câu hỏi đến Bedrock (Claude 3 Sonnet)
-        prompt = f"You are a DevOps technical interview bot. You are also a DevOps expert with DevOps Interview Knowledge. {question}"
+        prompt = f"You are a DevOps technical interview bot. You are also a DevOps expert with DevOps knowledge. {question}"
         logger.debug(f"Invoking Bedrock with prompt: {prompt}")
         response = bedrock.invoke_model(
             modelId="anthropic.claude-3-sonnet-20240229-v1:0",
@@ -147,23 +190,36 @@ def handle_interview(audio_path: str = None, text_input: str = None) -> dict:
         # Step 3: Trả về câu trả lời
         response_data = {"text": answer}
         if audio_path:
-            # Tạo audio trả lời bằng Polly
-            polly = boto3.client("polly", region_name="ap-southeast-2")
-            logger.debug("Synthesizing speech with Polly")
-            polly_response = polly.synthesize_speech(
-                Text=answer,
-                OutputFormat="mp3",
-                VoiceId="Joanna",
-                Engine="neural"
-            )
+            # Tạo audio trả lời bằng ElevenLabs
             output_audio = f"/tmp/{uuid.uuid4()}.mp3"
-            with open(output_audio, "wb") as f:
-                f.write(polly_response["AudioStream"].read())
+            elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+            elevenlabs_voice_id = os.getenv("ELEVENLABS_VOICE_ID")
+            if not elevenlabs_api_key or not elevenlabs_voice_id:
+                raise Exception("ElevenLabs API key or voice ID not configured")
 
-            # Upload file MP3 lên S3
-            output_audio_key = f"audio/output/{uuid.uuid4()}.mp3"
-            logger.debug(f"Uploading MP3 to S3: {bucket_name}/{output_audio_key}")
-            s3.upload_file(output_audio, bucket_name, output_audio_key)
+            logger.debug("Synthesizing speech with ElevenLabs")
+            synthesize_speech_elevenlabs(answer, elevenlabs_api_key, elevenlabs_voice_id, output_audio)
+
+            # Chuyển đổi MP3 sang OGG/Opus
+            output_ogg = f"/tmp/{uuid.uuid4()}.ogg"
+            try:
+                audio = AudioSegment.from_mp3(output_audio)
+                audio = audio.set_channels(1).set_frame_rate(16000)
+                audio.export(output_ogg, format="ogg", codec="libopus", parameters=["-strict", "-2"])
+                logger.debug(f"Converted OGG file size: {os.path.getsize(output_ogg)} bytes")
+            except Exception as e:
+                logger.error(f"Failed to convert MP3 to OGG: {str(e)}")
+                raise Exception(f"Failed to convert MP3 to OGG: {str(e)}")
+
+            # Upload file OGG lên S3
+            output_audio_key = f"audio/output/{uuid.uuid4()}.ogg"
+            logger.debug(f"Uploading OGG to S3: {bucket_name}/{output_audio_key}")
+            s3.upload_file(
+                Filename=output_ogg,
+                Bucket=bucket_name,
+                Key=output_audio_key,
+                ExtraArgs={"ContentType": "audio/ogg"}
+            )
             output_audio_url = f"https://{bucket_name}.s3.ap-southeast-2.amazonaws.com/{output_audio_key}"
             response_data["audio_url"] = output_audio_url
 
@@ -183,6 +239,9 @@ def handle_interview(audio_path: str = None, text_input: str = None) -> dict:
         if output_audio and os.path.exists(output_audio):
             logger.debug(f"Removing local output audio: {output_audio}")
             os.remove(output_audio)
+        if output_ogg and os.path.exists(output_ogg):
+            logger.debug(f"Removing local output OGG: {output_ogg}")
+            os.remove(output_ogg)
         if audio_key:
             try:
                 logger.debug(f"Deleting S3 object: {bucket_name}/{audio_key}")

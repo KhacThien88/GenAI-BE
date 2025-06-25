@@ -9,6 +9,7 @@ import os
 import uuid
 import logging
 import json
+import time
 from dotenv import load_dotenv
 import subprocess
 from pydub import AudioSegment
@@ -26,6 +27,8 @@ load_dotenv()
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")  # Cho Messenger
 PAGE_ACCESS_TOKEN_WHATSAPP = os.getenv("PAGE_ACCESS_TOKEN_WHATSAPP")  # Cho WhatsApp
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")  # Cho ElevenLabs
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")  # Cho ElevenLabs
 
 # URL cho WhatsApp
 WHATSAPP_API_URL = "https://graph.facebook.com/v20.0/{phone_number_id}/messages"
@@ -163,7 +166,12 @@ async def handle_webhook(request: Request):
                                     if PAGE_ACCESS_TOKEN_WHATSAPP:
                                         send_whatsapp_message(phone_number_id, sender_id, response["text"])
                                     if response.get("audio_url") and PAGE_ACCESS_TOKEN_WHATSAPP:
-                                        send_whatsapp_audio(phone_number_id, sender_id, response["audio_url"])
+                                        if validate_audio_url(response["audio_url"]):
+                                            if not send_whatsapp_audio(phone_number_id, sender_id, response["audio_url"]):
+                                                send_whatsapp_message(phone_number_id, sender_id, "Sorry, I couldn't send the audio response.")
+                                        else:
+                                            logger.error(f"Skipping audio send due to invalid URL: {response['audio_url']}")
+                                            send_whatsapp_message(phone_number_id, sender_id, "Sorry, I couldn't send the audio response.")
                                 except Exception as e:
                                     logger.error(f"Error processing WhatsApp text: {str(e)}")
                                     if PAGE_ACCESS_TOKEN_WHATSAPP:
@@ -215,7 +223,12 @@ async def handle_webhook(request: Request):
                                             if PAGE_ACCESS_TOKEN_WHATSAPP:
                                                 send_whatsapp_message(phone_number_id, sender_id, response["text"])
                                             if response.get("audio_url") and PAGE_ACCESS_TOKEN_WHATSAPP:
-                                                send_whatsapp_audio(phone_number_id, sender_id, response["audio_url"])
+                                                if validate_audio_url(response["audio_url"]):
+                                                    if not send_whatsapp_audio(phone_number_id, sender_id, response["audio_url"]):
+                                                        send_whatsapp_message(phone_number_id, sender_id, "Sorry, I couldn't send the audio response.")
+                                                else:
+                                                    logger.error(f"Skipping audio send due to invalid URL: {response['audio_url']}")
+                                                    send_whatsapp_message(phone_number_id, sender_id, "Sorry, I couldn't send the audio response.")
                                         else:
                                             logger.warning("Failed to download audio content")
                                             raise Exception("Failed to download audio content")
@@ -288,11 +301,39 @@ async def handle_webhook(request: Request):
         logger.error(f"Webhook error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Hàm kiểm tra URL âm thanh
+def validate_audio_url(audio_url, retries=3, delay=2):
+    valid_types = [
+        "audio/mpeg",
+        "audio/ogg",
+        "audio/ogg; codecs=opus",
+        "audio/amr",
+        "audio/mp4",
+        "audio/aac"
+    ]
+    for attempt in range(retries):
+        try:
+            response = requests.head(audio_url, timeout=5)
+            logger.debug(f"HEAD response headers: {response.headers}")
+            if response.status_code == 200:
+                content_type = response.headers.get("Content-Type", "").lower()
+                if any(valid_type in content_type for valid_type in valid_types):
+                    logger.debug(f"Valid audio URL: {audio_url}, Content-Type: {content_type}")
+                    return True
+                logger.error(f"Invalid Content-Type: {content_type} for URL: {audio_url}")
+                return False
+            logger.warning(f"Attempt {attempt + 1}: HEAD request failed with status {response.status_code}")
+        except requests.RequestException as e:
+            logger.warning(f"Attempt {attempt + 1}: HEAD request error: {str(e)}")
+        time.sleep(delay)
+    logger.error(f"Invalid audio URL after {retries} attempts: {audio_url}")
+    return False
+
 # Gửi tin nhắn WhatsApp
 def send_whatsapp_message(phone_number_id, recipient_id, text):
     if not PAGE_ACCESS_TOKEN_WHATSAPP:
         logger.error("PAGE_ACCESS_TOKEN_WHATSAPP is not configured")
-        return
+        return False
     url = WHATSAPP_API_URL.format(phone_number_id=phone_number_id)
     payload = {
         "messaging_product": "whatsapp",
@@ -305,17 +346,24 @@ def send_whatsapp_message(phone_number_id, recipient_id, text):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {PAGE_ACCESS_TOKEN_WHATSAPP}"
     }
-    response = requests.post(url, json=payload, headers=headers)
-    if response.status_code != 200:
-        logger.error(f"Failed to send WhatsApp message: {response.text} | Payload: {json.dumps(payload)}")
-    else:
+    try:
+        logger.debug(f"Sending WhatsApp message with payload: {json.dumps(payload, indent=2)}")
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        logger.debug(f"WhatsApp API response: {response.status_code} {response.text}")
+        if response.status_code != 200:
+            logger.error(f"Failed to send WhatsApp message: {response.text} | Payload: {json.dumps(payload)}")
+            return False
         logger.info(f"WhatsApp message sent to {recipient_id}")
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Error sending WhatsApp message: {str(e)}")
+        return False
 
 # Gửi tin nhắn âm thanh WhatsApp
 def send_whatsapp_audio(phone_number_id, recipient_id, audio_url):
     if not PAGE_ACCESS_TOKEN_WHATSAPP:
         logger.error("PAGE_ACCESS_TOKEN_WHATSAPP is not configured")
-        return
+        return False
     url = WHATSAPP_API_URL.format(phone_number_id=phone_number_id)
     payload = {
         "messaging_product": "whatsapp",
@@ -328,33 +376,45 @@ def send_whatsapp_audio(phone_number_id, recipient_id, audio_url):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {PAGE_ACCESS_TOKEN_WHATSAPP}"
     }
-    response = requests.post(url, json=payload, headers=headers)
-    if response.status_code != 200:
-        logger.error(f"Failed to send WhatsApp audio: {response.text} | Payload: {json.dumps(payload)}")
-    else:
+    try:
+        logger.debug(f"Sending WhatsApp audio with payload: {json.dumps(payload, indent=2)}")
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        logger.debug(f"WhatsApp API response: {response.status_code} {response.text}")
+        if response.status_code != 200:
+            logger.error(f"Failed to send WhatsApp audio: {response.text} | Payload: {json.dumps(payload)}")
+            return False
         logger.info(f"WhatsApp audio sent to {recipient_id}")
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Error sending WhatsApp audio: {str(e)}")
+        return False
 
 # Gửi tin nhắn Messenger
 def send_text_message(recipient_id, text):
     if not PAGE_ACCESS_TOKEN:
         logger.error("PAGE_ACCESS_TOKEN is not configured")
-        return
+        return False
     payload = {
         "recipient": {"id": recipient_id},
         "message": {"text": text[:640]}
     }
     headers = {"Content-Type": "application/json"}
     params = {"access_token": PAGE_ACCESS_TOKEN}
-    response = requests.post(MESSENGER_API_URL, json=payload, headers=headers, params=params)
-    if response.status_code != 200:
-        logger.error(f"Failed to send text message: {response.text}")
-    else:
+    try:
+        response = requests.post(MESSENGER_API_URL, json=payload, headers=headers, params=params, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"Failed to send text message: {response.text}")
+            return False
         logger.info(f"Text message sent to {recipient_id}")
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Error sending Messenger text: {str(e)}")
+        return False
 
 def send_audio_message(recipient_id, audio_url):
     if not PAGE_ACCESS_TOKEN:
         logger.error("PAGE_ACCESS_TOKEN is not configured")
-        return
+        return False
     payload = {
         "recipient": {"id": recipient_id},
         "message": {
@@ -366,29 +426,32 @@ def send_audio_message(recipient_id, audio_url):
     }
     headers = {"Content-Type": "application/json"}
     params = {"access_token": PAGE_ACCESS_TOKEN}
-    response = requests.post(MESSENGER_API_URL, json=payload, headers=headers, params=params)
-    if response.status_code != 200:
-        logger.error(f"Failed to send audio message: {response.text}")
-    else:
+    try:
+        response = requests.post(MESSENGER_API_URL, json=payload, headers=headers, params=params, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"Failed to send audio message: {response.text}")
+            return False
         logger.info(f"Audio message sent to {recipient_id}")
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Error sending Messenger audio: {str(e)}")
+        return False
 
 # Hàm tải nội dung audio từ WhatsApp
 def download_whatsapp_audio(audio_id):
     if not PAGE_ACCESS_TOKEN_WHATSAPP:
         logger.error("PAGE_ACCESS_TOKEN_WHATSAPP is not configured")
         return None
-    # Lấy metadata từ media_id
     media_url = f"https://graph.facebook.com/v20.0/{audio_id}"
     headers = {"Authorization": f"Bearer {PAGE_ACCESS_TOKEN_WHATSAPP}"}
-    response = requests.get(media_url, headers=headers)
-    if response.status_code == 200:
-        try:
+    try:
+        response = requests.get(media_url, headers=headers, timeout=10)
+        if response.status_code == 200:
             metadata = response.json()
             logger.debug(f"Media metadata: {json.dumps(metadata, indent=2)}")
             download_url = metadata.get("url")
             if download_url:
-                # Tải nội dung từ URL với token trong header
-                download_response = requests.get(download_url, headers=headers, stream=True)
+                download_response = requests.get(download_url, headers=headers, stream=True, timeout=10)
                 if download_response.status_code == 200:
                     content_type = download_response.headers.get("Content-Type", "").lower()
                     if "audio" not in content_type:
@@ -403,9 +466,9 @@ def download_whatsapp_audio(audio_id):
             else:
                 logger.error("No download URL found in metadata")
                 return None
-        except json.JSONDecodeError:
-            logger.error(f"Failed to decode metadata JSON: {response.text}")
+        else:
+            logger.error(f"Failed to get media info: {response.status_code} {response.text}")
             return None
-    else:
-        logger.error(f"Failed to get media info: {response.status_code} {response.text}")
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        logger.error(f"Error downloading WhatsApp audio: {str(e)}")
         return None
