@@ -1,4 +1,4 @@
-#!/home/ubuntu/GenAI-Assistant/backend/venv/bin/python3
+#!/home/ubuntu/GenAI-Assistant/GenAI-BE/venv/bin/python3
 
 import sys
 import json

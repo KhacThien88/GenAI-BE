@@ -1,4 +1,4 @@
-#!/home/ubuntu/GenAI-Assistant/backend/venv/bin/python3
+#!/home/ubuntu/GenAI-Assistant/GenAI-BE/venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys

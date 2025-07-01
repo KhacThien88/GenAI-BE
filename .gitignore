@@ -1,1 +1,43 @@
+# Bỏ file môi trường
 .env
+
+# Bỏ thư mục môi trường ảo
+venv/
+ENV/
+env/
+.venv/
+
+# Bỏ cache của Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Bỏ các file log, database tạm
+*.log
+*.sqlite3
+
+# Bỏ file hệ thống của IDE / hệ điều hành
+.DS_Store
+Thumbs.db
+
+# VSCode hoặc các IDE khác
+.vscode/
+.idea/
+
+# Docker
+*.pid
+*.tar
+
+# Byte-compiled / optimized / DLL files
+*.pyd
+*.so
+*.dll
+
+# File tạo ra từ test hoặc build
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Git files backup
+*.orig
